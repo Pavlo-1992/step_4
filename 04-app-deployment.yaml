@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: petshop-app-deployment
+  labels:
+    app: petshop-app
+spec:
+  replicas: 2 
+  selector:
+    matchLabels:
+      app: petshop-app
+  template:
+    metadata:
+      labels:
+        app: petshop-app
+    spec:
+      containers:
+      - name: petshop-app-container
+        # Використовуємо локально зібраний образ
+        image: petshop-app:latest
+        imagePullPolicy: Never # Важливо для MiniKube
+        ports:
+        - containerPort: 5000
+        env:
+        # Змінні середовища для підключення до БД (як у вашому app.py)
+        - name: DB_HOST
+          value: "mysql-service" 
+        - name: DB_USER
+          value: "root" 
+        - name: DB_NAME
+          value: "shop"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: petshop-mysql-secret
+              key: mysql-root-password

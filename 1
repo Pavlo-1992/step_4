@@ -1,0 +1,360 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: petshop-mysql-secret
+type: Opaque
+data:
+  # Пароль для кореневого користувача, закодований у base64: 'hard_passw0rd'
+  mysql-root-password: aGFyZF9wYXNzdzByZA==
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+spec:
+  # 'standard' - це типовий StorageClass для MiniKube
+  storageClassName: standard 
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-deployment
+  labels:
+    app: mysql
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - image: mysql:8.0
+        name: mysql
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: petshop-mysql-secret
+              key: mysql-root-password
+        - name: MYSQL_DATABASE
+          value: shop # Вказуємо вашу БД з коду
+        - name: MYSQL_USER
+          value: petshop # Вказуємо вашого користувача з коду (хоча ваш код використовує root)
+        # Монтуємо PVC
+        volumeMounts:
+        - name: mysql-persistent-storage
+          mountPath: /var/lib/mysql
+        ports:
+        - containerPort: 3306
+      volumes:
+      - name: mysql-persistent-storage
+        persistentVolumeClaim:
+          claimName: mysql-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service
+spec:
+  ports:
+  - port: 3306
+    targetPort: 3306
+  selector:
+    app: mysql
+  # ClusterIP дозволяє доступ лише всередині кластера
+  type: ClusterIP
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: petshop-app-deployment
+  labels:
+    app: petshop-app
+spec:
+  replicas: 2 
+  selector:
+    matchLabels:
+      app: petshop-app
+  template:
+    metadata:
+      labels:
+        app: petshop-app
+    spec:
+      containers:
+      - name: petshop-app-container
+        # Використовуємо локально зібраний образ
+        image: petshop-app:latest
+        imagePullPolicy: Never # Важливо для MiniKube
+        ports:
+        - containerPort: 5000
+        env:
+        # Змінні середовища для підключення до БД (як у вашому app.py)
+        - name: DB_HOST
+          value: "mysql-service" 
+        - name: DB_USER
+          value: "root" 
+        - name: DB_NAME
+          value: "shop"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: petshop-mysql-secret
+              key: mysql-root-password
+apiVersion: v1
+kind: Service
+metadata:
+  name: petshop-app-service
+spec:
+  selector:
+    app: petshop-app
+  type: NodePort # Для доступу ззовні MiniKube
+  ports:
+  - port: 80
+    targetPort: 5000
+    nodePort: 31080
+# Використовуємо офіційний образ Python
+FROM python:3.9-slim
+
+# Встановлюємо робочу директорію в контейнері
+WORKDIR /app
+
+# Копіюємо файл залежностей та встановлюємо залежності
+COPY requirements.txt .
+
+# Встановлення залежностей та інструментів збірки
+RUN pip install --no-cache-dir -r requirements.txt \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        pkg-config \
+        gcc \
+        default-libmysqlclient-dev \
+    && pip install mysqlclient
+
+# Копіюємо файли програми
+COPY app.py app.py
+COPY shop.py shop.py
+COPY mysql_connector.py mysql_connector.py
+COPY templates templates
+
+# Відкриваємо порт
+EXPOSE 5000
+
+# Команда для запуску програми за допомогою Gunicorn (продакшн-сервер)
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+Flask==3.0.3
+mysql-connector-python==8.2.0
+gunicorn
+# app.py
+
+import socket  # Make sure to import socket for resolve ip
+
+from flask import Flask, render_template, request, redirect, url_for
+from shop import PetShop
+import os
+
+
+app = Flask(__name__)
+
+
+# Get database configurations from environment variables  
+host = os.getenv('DB_HOST', 'mysql-service.dev-ns.svc.cluster.local')
+#host = os.getenv('DB_HOST', '192.168.1.211')
+
+user = os.getenv('DB_USER', 'petshop')
+password = os.getenv('DB_PASSWORD', 'hard_passw0rd')
+db_name = os.getenv('DB_NAME', 'shop')
+
+
+
+#host = "mysql-service.dev-ns.svc.cluster.local"  # Default host #This is the mane of mysql-service in yaml for kubernetes cluster
+##host = "localhost"
+#user = "petshop"
+#password = "hard_pass"
+
+# Initialize PetShop
+petshop = PetShop(host, user, password)
+petshop.create_shop()
+
+
+# Function to get the local IP address of the host
+def get_host_ip():
+    try:
+        # Get the local machine's hostname
+        hostname = socket.gethostname()
+        # Retrieve the local IP address associated with the hostname
+        local_ip = socket.gethostbyname(hostname)
+        return local_ip
+    except Exception as e:
+        return f"Unable to retrieve Host IP: {str(e)}"
+
+# Home page
+@app.route('/')
+def index():
+    host_ip = get_host_ip()  # Get the local host IP
+    return render_template('index.html', host_ip=host_ip)
+
+# Add pet - show form and handle submission
+@app.route('/add_pet', methods=['GET', 'POST'])
+def add_pet():
+    if request.method == 'POST':
+        name = request.form['name']
+        price = request.form['price']
+
+        if not name or not price:
+            return render_template('add_pet.html', error="Please provide both name and price.")
+        
+        ids = petshop.add_item(name, price)
+        return render_template('add_pet.html', success=f"Pet added with ID(s): {ids}")
+
+    return render_template('add_pet.html')
+
+# Delete pet by ID - show form and handle submission
+@app.route('/delete_pet', methods=['GET', 'POST'])
+def delete_pet():
+    if request.method == 'POST':
+        id = request.form['id']
+
+        if not id:
+            return render_template('delete_pet.html', error="Please provide an ID.")
+
+        pet = petshop.delete_item_by_id(id)
+        if not pet:
+            return render_template('delete_pet.html', error="Pet not found!.")
+
+        # If the pet exists, delete it
+        res = petshop.delete_item_by_id(id)
+        return render_template('delete_pet.html', success="Pet deleted successfully." if res else "Pet deleted successfully.")
+
+
+ 
+    return render_template('delete_pet.html')
+
+# Show list of pets
+@app.route('/list_pets')
+def list_pets():
+        
+    #query = "SELECT * FROM pets"
+    pets = petshop.get_all_items()
+    return render_template('list_pets.html', pets=pets)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+
+
+import mysql.connector
+import time
+
+class Mysql():
+    def __init__(self, host, user, pw):
+        max_retries = 30
+        retries = 0
+
+        # Keep trying to connect until max_retries
+        while retries < max_retries:
+            try:
+                self.mydb = mysql.connector.connect(
+                    host=host,
+                    user=user,
+                    password=pw
+                )
+                print("MySQL is ready.")
+                break
+            except mysql.connector.Error as err:
+                print(f"Waiting for MySQL... ({err})")
+                time.sleep(1)
+                retries += 1
+
+        if retries >= max_retries:
+            print("Unable to connect to MySQL. Exiting.")
+            exit(1)
+
+    # Helper method to execute queries with connection management
+    def query(self, text):
+        result = []
+        try:
+            # Open a cursor for executing the query
+            with self.mydb.cursor() as cursor:
+                cursor.execute(text)
+                try:
+                    # Attempt to fetch all results if query returns rows
+                    result = cursor.fetchall()
+                except mysql.connector.errors.InterfaceError:
+                    # No rows to fetch
+                    pass
+                try:
+                    # Commit changes to the database (INSERT, UPDATE, DELETE)
+                    self.mydb.commit()
+                except Exception as e:
+                    print(f"Commit failed: {e}")
+        except mysql.connector.Error as err:
+            print(f"Query failed: {err}")
+        return result
+
+    # Ensure connection is properly closed when no longer needed
+    def close_connection(self):
+        if self.mydb.is_connected():
+            self.mydb.close()
+            print("MySQL connection closed.")
+
+
+from mysql_connector import Mysql
+
+
+class PetShop(Mysql):
+    def create_shop(self):
+        query = "CREATE DATABASE IF NOT EXISTS shop"
+        self.query(query)
+        query = "USE shop"
+        self.query(query)
+        query = "CREATE TABLE IF NOT EXISTS pets (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), price INT)"
+        self.query(query)
+
+    def add_item(self, name, price):
+        query = f"INSERT INTO pets (name, price) VALUES ('{name}', {price});"
+        self.query(query)
+        query = f"SELECT id, name FROM pets WHERE name='{name}'"
+        res = self.query(query)
+        ids = []
+        for id_name in res:
+            if id_name[1] == name:
+                ids.append(id_name[0])
+        return ids
+
+    def delete_item(self, name):
+        query = f"DELETE FROM pets WHERE name='{name}';"
+        return self.query(query)
+
+
+    def delete_item_by_id(self, id):
+        # First, check if the pet exists
+        query = f"SELECT * FROM pets WHERE id={id};"
+        res = self.query(query)
+        if not res:  # If the query result is empty, pet doesn't exist
+            return False
+        
+        # If the pet exists, proceed to delete
+        query = f"DELETE FROM pets WHERE id={id};"
+        self.query(query)
+        return True  # Return True for successful deletion
+
+    def get_item_by_id(self, id):
+        query = f"SELECT * FROM pets WHERE id='{id}'"
+        res = self.query(query)
+        return res[0] if res else None
+
+    def get_all_items(self):
+        query = f"SELECT * FROM pets"
+        return self.query(query)
+        
+
+
+    def delete_shop(self):
+        self.query("DROP TABLE pets")
+

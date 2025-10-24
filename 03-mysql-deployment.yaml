@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-deployment
+  labels:
+    app: mysql
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - image: mysql:8.0
+        name: mysql
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: petshop-mysql-secret
+              key: mysql-root-password
+        - name: MYSQL_DATABASE
+          value: shop # Вказуємо вашу БД з коду
+        - name: MYSQL_USER
+          value: petshop # Вказуємо вашого користувача з коду (хоча ваш код використовує root)
+        # Монтуємо PVC
+        volumeMounts:
+        - name: mysql-persistent-storage
+          mountPath: /var/lib/mysql
+        ports:
+        - containerPort: 3306
+      volumes:
+      - name: mysql-persistent-storage
+        persistentVolumeClaim:
+          claimName: mysql-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service
+spec:
+  ports:
+  - port: 3306
+    targetPort: 3306
+  selector:
+    app: mysql
+  # ClusterIP дозволяє доступ лише всередині кластера
+  type: ClusterIP
